@@ -66,6 +66,7 @@ SEGUNDOS_POR_FRASE = 4  # para estimar quantas frases o vídeo tem antes de tran
 _modelos = {}
 _tradutor_local = None
 _parar = set()  # sessões em que clicaram em "Parar"
+_rodando = set()  # sessões com dublagem em andamento
 _logs = {}  # log de cada sessão, mostrado na tela
 _local = threading.local()  # log da dublagem que roda nesta thread
 
@@ -650,6 +651,7 @@ def dublar(links, arquivos, modo, nome_voz, volume_original, tamanho_modelo,
     prontos = []  # resultados de processar_video
     linhas = []  # (título, resultado, tempo) para o resumo
     erro = None
+    _rodando.add(sessao)
     try:
         for i, (tipo, origem) in enumerate(fila):
             lote.atual = i
@@ -676,6 +678,7 @@ def dublar(links, arquivos, modo, nome_voz, volume_original, tamanho_modelo,
             prontos.append(r)
             linhas.append((r["titulo"], "✅ Pronto", formato_tempo(r["tempo"])))
     finally:
+        _rodando.discard(sessao)
         _parar.discard(sessao)
         _local.log = None
 
@@ -700,6 +703,15 @@ def dublar(links, arquivos, modo, nome_voz, volume_original, tamanho_modelo,
 
 def fim_do_log(request: gr.Request):
     return mostrar_log(request), gr.Timer(active=False)
+
+
+def limpar(request: gr.Request):
+    """Apaga entradas e resultados da tela; as escolhas (modo, voz, pasta...) ficam."""
+    if request.session_hash in _rodando:
+        gr.Warning("Há uma dublagem em andamento. Clique em Parar antes de limpar.")
+        return [gr.skip()] * 7
+    _logs.pop(request.session_hash, None)
+    return "", None, None, None, "", "", gr.Audio(None, visible=False)
 
 
 def trocar_modo(modo):
@@ -739,6 +751,7 @@ with gr.Blocks(title="Dublador EN para PT") as app:
             with gr.Row():
                 botao = gr.Button("Dublar", variant="primary")
                 botao_parar = gr.Button("Parar", variant="stop")
+                botao_limpar = gr.Button("🧹 Limpar")
         with gr.Column():
             video_saida = gr.Video(label="Vídeo dublado")
             arquivos_saida = gr.File(label="Arquivos para baixar", file_count="multiple",
@@ -759,6 +772,8 @@ with gr.Blocks(title="Dublador EN para PT") as app:
         show_progress_on=[video_saida]).then(
         fim_do_log, None, [log_saida, relogio_log])
     botao_parar.click(parar, queue=False)
+    botao_limpar.click(limpar, None, [url, arquivo, video_saida, arquivos_saida,
+                                      tempo_saida, log_saida, amostra], queue=False)
 
 def ja_aberto(endereco):
     try:
