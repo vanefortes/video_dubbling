@@ -1,0 +1,6 @@
+gradio>=4.0
+yt-dlp
+faster-whisper
+edge-tts
+deep-translator
+numpy
