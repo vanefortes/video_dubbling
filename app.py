@@ -14,6 +14,7 @@ Uso: python app.py  e abra http://localhost:7860
 import asyncio
 import shutil
 import subprocess
+import time
 import uuid
 import wave
 from pathlib import Path
@@ -22,7 +23,7 @@ import edge_tts
 import gradio as gr
 import numpy as np
 import yt_dlp
-from deep_translator import GoogleTranslator
+from deep_translator import GoogleTranslator, MyMemoryTranslator
 from faster_whisper import WhisperModel
 
 SR = 24000  # taxa de amostragem do áudio dublado
@@ -35,7 +36,10 @@ VOZES = {
     "Thalita (feminina)": "pt-BR-ThalitaNeural",
 }
 
+AMOSTRA = "Olá! Esta é a voz que vai dublar o seu vídeo em português."
+
 _modelos = {}
+_parar = set()  # sessões em que clicaram em "Parar"
 
 
 # ---------- utilidades ----------
@@ -86,6 +90,22 @@ def formato_srt(seg):
     return f"{int(h):02}:{int(m):02}:{int(s):02},{ms:03}"
 
 
+def formato_tempo(seg):
+    m, s = divmod(int(round(seg)), 60)
+    return f"{m} min {s:02} s" if m else f"{s} s"
+
+
+def resumo_tempos(marcas, duracao_video):
+    """Monta o texto com o tempo de cada etapa e o total."""
+    linhas = ["| Etapa | Tempo |", "|---|---|"]
+    for (nome, ini), (_, fim) in zip(marcas, marcas[1:]):
+        linhas.append(f"| {nome} | {formato_tempo(fim - ini)} |")
+    total = marcas[-1][1] - marcas[0][1]
+    linhas.append(f"| **Total** | **{formato_tempo(total)}** |")
+    return (f"⏱️ Dublagem concluída em **{formato_tempo(total)}** "
+            f"(vídeo de {formato_tempo(duracao_video)})\n\n" + "\n".join(linhas))
+
+
 # ---------- etapas ----------
 
 def baixar_video(url, pasta):
@@ -104,31 +124,54 @@ def baixar_video(url, pasta):
     return arquivos[0]
 
 
-def transcrever(video, pasta, tamanho_modelo):
+def transcrever(video, pasta, tamanho_modelo, checar):
     audio = pasta / "audio_en.wav"
     rodar(["ffmpeg", "-v", "error", "-y", "-i", str(video),
            "-ac", "1", "-ar", "16000", str(audio)])
     if tamanho_modelo not in _modelos:
         _modelos[tamanho_modelo] = WhisperModel(
             tamanho_modelo, device="auto", compute_type="default")
-    segmentos, _ = _modelos[tamanho_modelo].transcribe(
-        str(audio), language="en", vad_filter=True)
-    return [{"inicio": s.start, "fim": s.end, "en": s.text.strip()}
-            for s in segmentos if s.text.strip()]
+    try:
+        return _segmentos(_modelos[tamanho_modelo], audio, checar)
+    except RuntimeError as e:
+        # placa NVIDIA sem as bibliotecas CUDA: usa o processador
+        if not any(p in str(e).lower() for p in ("cuda", "cublas", "cudnn")):
+            raise
+        _modelos[tamanho_modelo] = WhisperModel(
+            tamanho_modelo, device="cpu", compute_type="int8")
+        return _segmentos(_modelos[tamanho_modelo], audio, checar)
 
 
-def traduzir(segmentos):
-    tradutor = GoogleTranslator(source="en", target="pt")
+def _segmentos(modelo, audio, checar):
+    segmentos, _ = modelo.transcribe(str(audio), language="en", vad_filter=True)
+    resultado = []
+    for s in segmentos:  # o whisper transcreve uma frase por vez
+        checar()
+        if s.text.strip():
+            resultado.append({"inicio": s.start, "fim": s.end, "en": s.text.strip()})
+    return resultado
+
+
+def traduzir(segmentos, checar):
+    tradutores = [GoogleTranslator(source="en", target="pt"),
+                  MyMemoryTranslator(source="en-US", target="pt-BR")]
     for s in segmentos:
-        try:
-            s["pt"] = tradutor.translate(s["en"]) or s["en"]
-        except Exception:
-            s["pt"] = s["en"]
+        checar()
+        while tradutores:
+            try:
+                s["pt"] = tradutores[0].translate(s["en"]) or s["en"]
+                break
+            except Exception:
+                tradutores.pop(0)  # recusou (ex.: Google bloqueou): usa o próximo
+        else:
+            raise gr.Error("Os tradutores gratuitos recusaram o pedido. "
+                           "Tente de novo mais tarde.")
     return segmentos
 
 
-async def _gerar_vozes(segmentos, voz, pasta):
+async def _gerar_vozes(segmentos, voz, pasta, checar):
     for i, s in enumerate(segmentos):
+        checar()
         arq = pasta / f"fala_{i:04}.mp3"
         await edge_tts.Communicate(s["pt"], voz).save(str(arq))
         s["arquivo"] = arq
@@ -172,37 +215,66 @@ def salvar_srt(segmentos, arquivo):
 
 # ---------- função principal ----------
 
+def ouvir_voz(nome_voz):
+    pasta = PASTA_SAIDA / "amostras"
+    pasta.mkdir(exist_ok=True)
+    arq = pasta / f"{VOZES[nome_voz]}.mp3"
+    if not arq.exists():
+        asyncio.run(edge_tts.Communicate(AMOSTRA, VOZES[nome_voz]).save(str(arq)))
+    return str(arq)
+
+
+def parar(request: gr.Request):
+    _parar.add(request.session_hash)
+    gr.Info("Parando... a etapa atual termina em instantes.")
+
+
 def dublar(url, arquivo_enviado, nome_voz, volume_original, tamanho_modelo,
-           progresso=gr.Progress()):
+           request: gr.Request, progresso=gr.Progress()):
     if not url and not arquivo_enviado:
         raise gr.Error("Cole um link ou envie um arquivo de vídeo.")
+
+    sessao = request.session_hash
+    _parar.discard(sessao)
+
+    def checar():
+        if sessao in _parar:
+            raise gr.Error("Dublagem interrompida.")
 
     pasta = PASTA_SAIDA / uuid.uuid4().hex[:8]
     pasta.mkdir(parents=True)
     temp = pasta / "temp"
     temp.mkdir()
 
+    marcas = []  # (nome da etapa, horário em que começou)
+
+    def etapa(fracao, desc, nome):
+        checar()
+        marcas.append((nome, time.monotonic()))
+        progresso(fracao, desc=desc)
+
     try:
-        progresso(0.05, desc="Baixando vídeo...")
+        etapa(0.05, "Baixando vídeo...", "Download")
         if arquivo_enviado:
             video = temp / ("original" + Path(arquivo_enviado).suffix)
             shutil.copy(arquivo_enviado, video)
         else:
             video = baixar_video(url.strip(), temp)
 
-        progresso(0.2, desc="Transcrevendo o inglês (pode demorar)...")
-        segmentos = transcrever(video, temp, tamanho_modelo)
+        etapa(0.2, "Transcrevendo o inglês (pode demorar)...", "Transcrição")
+        segmentos = transcrever(video, temp, tamanho_modelo, checar)
         if not segmentos:
             raise gr.Error("Não encontrei fala em inglês nesse vídeo.")
 
-        progresso(0.5, desc="Traduzindo para português...")
-        traduzir(segmentos)
+        etapa(0.5, "Traduzindo para português...", "Tradução")
+        traduzir(segmentos, checar)
 
-        progresso(0.65, desc="Gerando a voz em português...")
-        asyncio.run(_gerar_vozes(segmentos, VOZES[nome_voz], temp))
+        etapa(0.65, "Gerando a voz em português...", "Geração da voz")
+        asyncio.run(_gerar_vozes(segmentos, VOZES[nome_voz], temp, checar))
 
-        progresso(0.85, desc="Montando o vídeo dublado...")
-        trilha = montar_audio(segmentos, duracao(video))
+        etapa(0.85, "Montando o vídeo dublado...", "Montagem do vídeo")
+        duracao_video = duracao(video)
+        trilha = montar_audio(segmentos, duracao_video)
         audio_pt = temp / "audio_pt.wav"
         salvar_wav(audio_pt, trilha)
 
@@ -210,6 +282,7 @@ def dublar(url, arquivo_enviado, nome_voz, volume_original, tamanho_modelo,
         juntar(video, audio_pt, saida, volume_original)
         srt = pasta / "legendas_pt.srt"
         salvar_srt(segmentos, srt)
+        marcas.append(("Fim", time.monotonic()))
     except gr.Error:
         raise
     except subprocess.CalledProcessError as e:
@@ -217,10 +290,13 @@ def dublar(url, arquivo_enviado, nome_voz, volume_original, tamanho_modelo,
     except Exception as e:
         raise gr.Error(f"Erro: {e}")
     finally:
+        _parar.discard(sessao)
         shutil.rmtree(temp, ignore_errors=True)
 
     progresso(1.0, desc="Pronto!")
-    return str(saida), str(srt)
+    resumo = resumo_tempos(marcas, duracao_video)
+    print(resumo.replace("**", ""))
+    return str(saida), str(srt), resumo
 
 
 # ---------- interface ----------
@@ -236,16 +312,27 @@ with gr.Blocks(title="Dublador EN para PT") as app:
             arquivo = gr.File(label="Ou envie um arquivo de vídeo",
                               file_types=["video"], type="filepath")
             voz = gr.Dropdown(list(VOZES), value="Antonio (masculina)", label="Voz")
+            botao_ouvir = gr.Button("🔊 Ouvir a voz", size="sm")
+            amostra = gr.Audio(label="Amostra da voz", autoplay=True,
+                               interactive=False, visible=False)
             volume = gr.Slider(0, 0.5, value=0.1, step=0.05,
                                label="Volume do áudio original ao fundo")
             modelo = gr.Dropdown(["tiny", "base", "small", "medium"], value="small",
                                  label="Precisão da transcrição (maior = melhor e mais lento)")
-            botao = gr.Button("Dublar", variant="primary")
+            with gr.Row():
+                botao = gr.Button("Dublar", variant="primary")
+                botao_parar = gr.Button("Parar", variant="stop")
         with gr.Column():
             video_saida = gr.Video(label="Vídeo dublado")
             srt_saida = gr.File(label="Legendas em português (.srt)")
+            tempo_saida = gr.Markdown()
 
-    botao.click(dublar, [url, arquivo, voz, volume, modelo], [video_saida, srt_saida])
+    botao_ouvir.click(lambda nome: gr.Audio(ouvir_voz(nome), visible=True),
+                      voz, amostra)
+    botao.click(dublar, [url, arquivo, voz, volume, modelo],
+                [video_saida, srt_saida, tempo_saida],
+                show_progress_on=[video_saida])
+    botao_parar.click(parar, queue=False)
 
 if __name__ == "__main__":
     app.launch(inbrowser=True, favicon_path=str(Path(__file__).parent / "icone.png"))
