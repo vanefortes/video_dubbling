@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="corpo" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3a3a3a"/>
+      <stop offset="1" stop-color="#0d0d0d"/>
+    </linearGradient>
+    <pattern id="listras" width="40" height="40" patternUnits="userSpaceOnUse" patternTransform="skewX(-35)">
+      <rect width="40" height="40" fill="#1a1a1a"/>
+      <rect width="20" height="40" fill="#f2f2f2"/>
+    </pattern>
+  </defs>
+
+  <!-- haste de cima, aberta -->
+  <g transform="rotate(-16 40 96)">
+    <rect x="34" y="68" width="196" height="30" rx="4" fill="url(#listras)" stroke="#111" stroke-width="4"/>
+  </g>
+
+  <!-- haste fixa -->
+  <rect x="34" y="100" width="196" height="30" rx="2" fill="url(#listras)" stroke="#111" stroke-width="4"/>
+
+  <!-- dobradiça -->
+  <rect x="26" y="62" width="40" height="66" rx="8" fill="#2a2a2a" stroke="#111" stroke-width="4"/>
+  <circle cx="38" cy="76" r="5" fill="#ddd"/>
+  <circle cx="54" cy="76" r="5" fill="#ddd"/>
+  <circle cx="46" cy="112" r="5" fill="#ddd"/>
+
+  <!-- corpo -->
+  <rect x="34" y="132" width="196" height="104" rx="8" fill="url(#corpo)" stroke="#111" stroke-width="4"/>
+
+  <!-- play -->
+  <circle cx="132" cy="176" r="32" fill="none" stroke="#fff" stroke-width="7"/>
+  <path d="M122 158 L150 176 L122 194 Z" fill="#fff"/>
+
+  <!-- linhas da claquete -->
+  <path d="M52 222 H212 M92 214 V230 M132 214 V230 M172 214 V230" stroke="#fff" stroke-width="3" fill="none"/>
+</svg>

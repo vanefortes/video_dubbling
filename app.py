@@ -248,4 +248,4 @@ with gr.Blocks(title="Dublador EN para PT") as app:
     botao.click(dublar, [url, arquivo, voz, volume, modelo], [video_saida, srt_saida])
 
 if __name__ == "__main__":
-    app.launch(inbrowser=True)
+    app.launch(inbrowser=True, favicon_path=str(Path(__file__).parent / "icone.png"))
