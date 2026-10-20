@@ -21,6 +21,7 @@ import time
 import urllib.request
 import uuid
 import wave
+import webbrowser
 import zipfile
 from pathlib import Path
 
@@ -759,5 +760,19 @@ with gr.Blocks(title="Dublador EN para PT") as app:
         fim_do_log, None, [log_saida, relogio_log])
     botao_parar.click(parar, queue=False)
 
+def ja_aberto(endereco):
+    try:
+        urllib.request.urlopen(endereco, timeout=2)
+        return True
+    except OSError:
+        return False
+
+
 if __name__ == "__main__":
-    app.launch(inbrowser=True, favicon_path=str(Path(__file__).parent / "icone.png"))
+    endereco = "http://127.0.0.1:7860"
+    if ja_aberto(endereco):  # clicou no atalho de novo: só mostra o app que já roda
+        print(f"O dublador já está aberto em {endereco}")
+        webbrowser.open(endereco)
+    else:
+        app.launch(server_port=7860, inbrowser=True,
+                   favicon_path=str(Path(__file__).parent / "icone.png"))
