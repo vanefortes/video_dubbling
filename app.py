@@ -16,13 +16,17 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.request
 import uuid
 import wave
+import zipfile
 from pathlib import Path
 
+import ctranslate2
 import edge_tts
 import gradio as gr
 import numpy as np
+import sentencepiece
 import yt_dlp
 from deep_translator import GoogleTranslator, MyMemoryTranslator
 from faster_whisper import WhisperModel
@@ -40,6 +44,12 @@ VOZES = {
 AMOSTRA = "Olá! Esta é a voz que vai dublar o seu vídeo em português."
 
 MODOS = ["Dublagem e legenda", "Só dublagem", "Só legenda"]
+TRADUTORES = ["No computador (rápido e sem limite)", "Online (Google ou MyMemory)"]
+
+# Tradutor que roda no computador: modelo OPUS-MT inglês -> português do Brasil
+# (licença CC-BY 4.0), empacotado pelo projeto Argos Translate
+MODELO_TRADUCAO = "https://argos-net.com/v1/translate-en_pb-1_9.argosmodel"
+PASTA_MODELOS = Path.home() / ".cache" / "dublador"
 ETAPAS = ["Download", "Transcrição", "Tradução", "Geração da voz", "Montagem do vídeo"]
 
 # Ritmo de cada etapa, usado para prever o tempo das etapas que ainda não
@@ -50,6 +60,7 @@ _ritmo = {"tiny": 0.05, "base": 0.1, "small": 0.3, "medium": 0.8,
 SEGUNDOS_POR_FRASE = 4  # para estimar quantas frases o vídeo tem antes de transcrever
 
 _modelos = {}
+_tradutor_local = None
 _parar = set()  # sessões em que clicaram em "Parar"
 _logs = {}  # log de cada sessão, mostrado na tela
 _local = threading.local()  # log da dublagem que roda nesta thread
@@ -247,14 +258,25 @@ def _segmentos(modelo, audio, duracao_video, passo):
     return resultado
 
 
-def traduzir(segmentos, passo):
+def traduzir(segmentos, passo, online):
+    pendentes = _traduzir_online(segmentos, passo) if online else segmentos
+    if pendentes:
+        _traduzir_local(pendentes, passo)
+    return segmentos
+
+
+def _traduzir_online(segmentos, passo):
+    """Traduz pela internet. Devolve as frases que ficaram sem tradução."""
     tradutores = [GoogleTranslator(source="en", target="pt"),
                   MyMemoryTranslator(source="en-US", target="pt-BR")]
     for i, s in enumerate(segmentos):
         passo(i, len(segmentos))
         while tradutores:
             try:
-                s["pt"] = tradutores[0].translate(s["en"]) or s["en"]
+                pt = tradutores[0].translate(s["en"]) or s["en"]
+                if "MYMEMORY WARNING" in pt:
+                    raise RuntimeError("limite diário atingido")
+                s["pt"] = pt
                 registrar(f"[{posicao(s['inicio'])}] PT: {s['pt']}")
                 break
             except Exception as e:
@@ -262,9 +284,48 @@ def traduzir(segmentos, passo):
                 registrar(f"{type(tradutores.pop(0)).__name__} recusou "
                           f"({type(e).__name__}). Tentando o próximo tradutor.")
         else:
-            raise gr.Error("Os tradutores gratuitos recusaram o pedido. "
-                           "Tente de novo mais tarde.")
-    return segmentos
+            registrar("Os tradutores online recusaram. "
+                      "Continuando com o tradutor do computador.")
+            return segmentos[i:]
+    return []
+
+
+def carregar_tradutor_local():
+    global _tradutor_local
+    if _tradutor_local is None:
+        pasta = PASTA_MODELOS / "translate-en_pb-1_9"
+        if not pasta.exists():
+            registrar("Baixando o modelo de tradução (66 MB, só na primeira vez)...")
+            PASTA_MODELOS.mkdir(parents=True, exist_ok=True)
+            arquivo = PASTA_MODELOS / "en_pb.zip"
+            # o servidor recusa o User-Agent padrão do Python
+            pedido = urllib.request.Request(MODELO_TRADUCAO,
+                                            headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(pedido) as resposta, open(arquivo, "wb") as f:
+                shutil.copyfileobj(resposta, f)
+            temp = PASTA_MODELOS / "extraindo"
+            shutil.rmtree(temp, ignore_errors=True)
+            with zipfile.ZipFile(arquivo) as z:
+                z.extractall(temp)
+            (temp / pasta.name).rename(pasta)  # só aparece quando está completo
+            shutil.rmtree(temp)
+            arquivo.unlink()
+        _tradutor_local = (
+            sentencepiece.SentencePieceProcessor(model_file=str(pasta / "sentencepiece.model")),
+            ctranslate2.Translator(str(pasta / "model"), device="cpu"))
+    return _tradutor_local
+
+
+def _traduzir_local(segmentos, passo, lote=16):
+    sp, modelo = carregar_tradutor_local()
+    for i in range(0, len(segmentos), lote):
+        passo(i, len(segmentos))
+        grupo = segmentos[i:i + lote]
+        resultados = modelo.translate_batch(
+            [sp.encode(s["en"], out_type=str) for s in grupo], beam_size=4)
+        for s, r in zip(grupo, resultados):
+            s["pt"] = "".join(r.hypotheses[0]).replace("▁", " ").strip() or s["en"]
+            registrar(f"[{posicao(s['inicio'])}] PT: {s['pt']}")
 
 
 async def _gerar_vozes(segmentos, voz, pasta, passo):
@@ -347,7 +408,7 @@ def mostrar_log(request: gr.Request):
 
 
 def dublar(url, arquivo_enviado, modo, nome_voz, volume_original, tamanho_modelo,
-           request: gr.Request, progresso=gr.Progress()):
+           tradutor, request: gr.Request, progresso=gr.Progress()):
     if not url and not arquivo_enviado:
         raise gr.Error("Cole um link ou envie um arquivo de vídeo.")
 
@@ -359,7 +420,7 @@ def dublar(url, arquivo_enviado, modo, nome_voz, volume_original, tamanho_modelo
     _logs[sessao] = _local.log = []
     registrar(f"Início: {'arquivo enviado' if arquivo_enviado else url.strip()} "
               f"| {modo}" + (f" | voz {nome_voz}" if dublagem else "")
-              + f" | precisão '{tamanho_modelo}'")
+              + f" | precisão '{tamanho_modelo}' | tradutor {tradutor}")
 
     def checar():
         if sessao in _parar:
@@ -407,7 +468,7 @@ def dublar(url, arquivo_enviado, modo, nome_voz, volume_original, tamanho_modelo
         registrar(f"Transcrição concluída: {len(segmentos)} frases")
 
         etapa("Tradução", "Traduzindo para português...")
-        traduzir(segmentos, passo)
+        traduzir(segmentos, passo, online=tradutor != TRADUTORES[0])
 
         srt = pasta / "legendas_pt.srt" if legenda else None
         if legenda:
@@ -492,6 +553,7 @@ with gr.Blocks(title="Dublador EN para PT") as app:
                                    label="Volume do áudio original ao fundo")
             modelo = gr.Dropdown(["tiny", "base", "small", "medium"], value="small",
                                  label="Precisão da transcrição (maior = melhor e mais lento)")
+            tradutor = gr.Radio(TRADUTORES, value=TRADUTORES[0], label="Tradutor")
             with gr.Row():
                 botao = gr.Button("Dublar", variant="primary")
                 botao_parar = gr.Button("Parar", variant="stop")
@@ -508,7 +570,7 @@ with gr.Blocks(title="Dublador EN para PT") as app:
                       voz, amostra)
     relogio_log.tick(mostrar_log, None, log_saida, show_progress="hidden")
     botao.click(lambda: gr.Timer(active=True), None, relogio_log).then(
-        dublar, [url, arquivo, modo, voz, volume, modelo],
+        dublar, [url, arquivo, modo, voz, volume, modelo, tradutor],
         [video_saida, srt_saida, tempo_saida],
         show_progress_on=[video_saida]).then(
         fim_do_log, None, [log_saida, relogio_log])

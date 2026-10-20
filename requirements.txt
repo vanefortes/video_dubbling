@@ -4,3 +4,5 @@ faster-whisper
 edge-tts
 deep-translator
 numpy
+ctranslate2
+sentencepiece
