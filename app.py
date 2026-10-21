@@ -46,6 +46,7 @@ VOZES = {
 
 AMOSTRA = "Olá! Esta é a voz que vai dublar o seu vídeo em português."
 VOLUME_ORIGINAL = 0  # volume do áudio em inglês ao fundo da dublagem (0 = sem áudio original)
+VELOCIDADE_MAX_FALA = 1.5  # acima disso, o vídeo fica mais lento para a fala caber
 
 MODOS = ["Dublagem e legenda", "Só dublagem", "Só legenda"]
 TRADUTORES = ["No computador (rápido e sem limite)", "Online (Google ou MyMemory)"]
@@ -188,15 +189,17 @@ def escolher_pasta(atual):
 def copiar_para(destino, arquivos):
     """Copia os arquivos para a pasta escolhida sem sobrescrever nada.
     Os arquivos de um mesmo vídeo ficam com o mesmo nome base, ex.:
-    "Aula 1_dublado.mp4" e "Aula 1_dublado.srt" (os players abrem a legenda sozinhos)."""
+    "Aula 1_dublado.mp4", "Aula 1_dublado.srt" e "Aula 1_dublado.en.srt"
+    (os players abrem a legenda sozinhos)."""
     base = arquivos[0].stem
+    finais = [a.name[len(base):] for a in arquivos]  # ".mp4", ".srt", ".en.srt"
     n = 1
-    while any((destino / f"{base}{a.suffix}").exists() for a in arquivos):
+    while any((destino / f"{base}{f}").exists() for f in finais):
         n += 1
         base = f"{arquivos[0].stem} ({n})"
     copias = []
-    for a in arquivos:
-        alvo = destino / f"{base}{a.suffix}"
+    for a, final in zip(arquivos, finais):
+        alvo = destino / f"{base}{final}"
         try:
             os.link(a, alvo)  # mesmo disco: não ocupa espaço a mais
         except OSError:
@@ -438,30 +441,69 @@ async def _gerar_vozes(segmentos, voz, pasta, passo, tentativas=3):
                        "e tente de novo.")
 
 
+def nova_posicao(t, trechos):
+    """Onde o instante t do vídeo original cai no vídeo com trechos desacelerados."""
+    return t + sum((fator - 1) * min(max(t - a, 0), b - a) for a, b, fator in trechos)
+
+
 def montar_audio(segmentos, duracao_total, passo):
-    """Coloca cada fala no seu tempo, acelerando se não couber."""
-    trilha = np.zeros(int((duracao_total + 5) * SR), dtype=np.float32)
+    """Coloca cada fala no seu tempo. Se não couber, acelera a fala até
+    VELOCIDADE_MAX_FALA; se ainda assim não couber, marca o trecho do vídeo para
+    ficar mais lento. Devolve a trilha e os trechos (início, fim, fator)."""
+    clipes, trechos = [], []
     for i, s in enumerate(segmentos):
         passo(i, len(segmentos))
         if "arquivo" not in s:  # frase que ficou sem voz
+            clipes.append(None)
             continue
         clipe = carregar_pcm(s["arquivo"])
         proximo = segmentos[i + 1]["inicio"] if i + 1 < len(segmentos) else duracao_total
-        espaco = max(proximo - s["inicio"], 0.3)
+        espaco = max(proximo - s["inicio"], 0.05)
         dur = len(clipe) / SR
         if dur > espaco:
-            tempo = min(dur / espaco, 1.6)
-            registrar(f"[{posicao(s['inicio'])}] Fala em português mais longa: "
-                      f"acelerada {tempo:.2f}x")
+            tempo = min(dur / espaco, VELOCIDADE_MAX_FALA)
             clipe = carregar_pcm(s["arquivo"], tempo=tempo)
-        ini = int(s["inicio"] * SR)
-        fim = min(ini + len(clipe), len(trilha))
-        trilha[ini:fim] += clipe[: fim - ini]
-    return trilha[: int(duracao_total * SR)]
+            fator = (len(clipe) / SR) / espaco
+            if fator > 1.01:
+                trechos.append((s["inicio"], s["inicio"] + espaco, fator))
+                registrar(f"[{posicao(s['inicio'])}] Fala acelerada {tempo:.2f}x e "
+                          f"vídeo desacelerado {fator:.2f}x neste trecho")
+            elif tempo > 1.01:
+                registrar(f"[{posicao(s['inicio'])}] Fala em português mais longa: "
+                          f"acelerada {tempo:.2f}x")
+        clipes.append(clipe)
+
+    duracao_nova = nova_posicao(duracao_total, trechos)
+    trilha = np.zeros(int((duracao_nova + 1) * SR), dtype=np.float32)
+    for s, clipe in zip(segmentos, clipes):
+        if clipe is not None:
+            ini = int(nova_posicao(s["inicio"], trechos) * SR)
+            fim = min(ini + len(clipe), len(trilha))
+            trilha[ini:fim] += clipe[: fim - ini]
+    return trilha[: int(duracao_nova * SR)], trechos
 
 
-def juntar(video, saida, audio_pt=None, volume_original=0, srt=None):
-    """Monta o vídeo final com a voz em português e/ou a faixa de legenda."""
+def quadros_por_segundo(video):
+    out = rodar(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0",
+                 str(video)]).stdout.decode().strip()
+    return out or "30"
+
+
+def desacelerar_video(video, saida, trechos):
+    """Deixa os trechos do vídeo mais lentos (o áudio original é descartado)."""
+    # cada trecho atrasa o que vem depois: T + (fator - 1) * parte já percorrida do trecho
+    termos = "".join(f"+{fator - 1:.4f}*clip(T-{a:.3f},0,{b - a:.3f})"
+                     for a, b, fator in trechos)
+    rodar(["ffmpeg", "-v", "error", "-y", "-i", str(video), "-an",
+           "-vf", f"setpts='(T{termos})/TB'", "-vsync", "cfr",
+           "-r", quadros_por_segundo(video), "-c:v", "libx264", "-preset", "veryfast",
+           "-crf", "20", "-pix_fmt", "yuv420p", str(saida)])
+
+
+def juntar(video, saida, audio_pt=None, volume_original=0, legendas=()):
+    """Monta o vídeo final com a voz em português e/ou as faixas de legenda.
+    legendas: lista de (arquivo .srt, código do idioma, nome da faixa)."""
     entradas = ["-i", str(video)]
     if audio_pt:
         entradas += ["-i", str(audio_pt)]
@@ -475,19 +517,22 @@ def juntar(video, saida, audio_pt=None, volume_original=0, srt=None):
         # e o -shortest cortaria o vídeo no fim da última legenda
     else:  # só legenda: mantém o áudio original
         mapa = ["-map", "0:v", "-map", "0:a?"]
-    if srt:
-        mapa += ["-map", f"{len(entradas) // 2}:s", "-c:s", "mov_text",
-                 "-metadata:s:s:0", "language=por"]
+    for j, (srt, idioma, nome) in enumerate(legendas):
+        mapa += ["-map", f"{len(entradas) // 2}:s",
+                 f"-metadata:s:s:{j}", f"language={idioma}",
+                 f"-metadata:s:s:{j}", f"title={nome}"]
         entradas += ["-i", str(srt)]
+    if legendas:  # a primeira faixa (português, se houver) aparece por padrão
+        mapa += ["-c:s", "mov_text", "-disposition:s:0", "default"]
     rodar(["ffmpeg", "-v", "error", "-y", *entradas, *mapa,
            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", str(saida)])
 
 
-def salvar_srt(segmentos, arquivo):
+def salvar_srt(segmentos, arquivo, idioma="pt"):
     linhas = []
     for i, s in enumerate(segmentos, 1):
         linhas += [str(i), f"{formato_srt(s['inicio'])} --> {formato_srt(s['fim'])}",
-                   s["pt"], ""]
+                   s[idioma], ""]
     arquivo.write_text("\n".join(linhas), encoding="utf-8")
 
 
@@ -512,7 +557,7 @@ def mostrar_log(request: gr.Request):
 
 
 def processar_video(tipo, origem, modo, nome_voz, volume_original, tamanho_modelo,
-                    tradutor, destino, relogio, checar):
+                    tradutor, legenda_en, destino, relogio, checar):
     """Dubla e/ou legenda um vídeo (link ou arquivo) e devolve o que foi gerado."""
     dublagem = modo != "Só legenda"
     legenda = modo != "Só dublagem"
@@ -562,8 +607,7 @@ def processar_video(tipo, origem, modo, nome_voz, volume_original, tamanho_model
 
         base = f"{nome}_{'dublado' if dublagem else 'legendado'}"
         srt = pasta / f"{base}.srt" if legenda else None
-        if legenda:
-            salvar_srt(segmentos, srt)
+        trechos = []
 
         audio_pt = None
         if dublagem:
@@ -571,20 +615,41 @@ def processar_video(tipo, origem, modo, nome_voz, volume_original, tamanho_model
             asyncio.run(_gerar_vozes(segmentos, VOZES[nome_voz], temp, passo))
 
             etapa("Montagem do vídeo", "Montando o vídeo dublado...")
-            trilha = montar_audio(segmentos, duracao_video, passo)
+            trilha, trechos = montar_audio(segmentos, duracao_video, passo)
             audio_pt = temp / "audio_pt.wav"
             salvar_wav(audio_pt, trilha)
+            if trechos:
+                duracao_nova = nova_posicao(duracao_video, trechos)
+                registrar(f"Desacelerando {len(trechos)} trecho(s) do vídeo para a fala "
+                          f"caber: {formato_tempo(duracao_video)} → "
+                          f"{formato_tempo(duracao_nova)}...")
+                lento = temp / "video_lento.mp4"
+                desacelerar_video(video, lento, trechos)
+                video = lento
         else:
             etapa("Montagem do vídeo", "Colocando a legenda no vídeo...")
 
+        # legendas nos tempos do vídeo final (que pode ter ficado mais longo)
+        nos_tempos_finais = [{**s, "inicio": nova_posicao(s["inicio"], trechos),
+                              "fim": nova_posicao(s["fim"], trechos)} for s in segmentos]
+        legendas = []
+        if legenda:
+            salvar_srt(nos_tempos_finais, srt)
+            legendas.append((srt, "por", "Português"))
+        srt_en = pasta / f"{base}.en.srt" if legenda_en else None
+        if legenda_en:
+            salvar_srt(nos_tempos_finais, srt_en, idioma="en")
+            legendas.append((srt_en, "eng", "English"))
+
         registrar("Montando o vídeo final"
                   + (" com a voz em português" if dublagem else "")
-                  + (" e a faixa de legenda" if dublagem and legenda else "")
-                  + (" com a faixa de legenda" if legenda and not dublagem else "")
+                  + (" e" if dublagem and legendas else "")
+                  + (" com" if legendas and not dublagem else "")
+                  + (f" legenda em {' e '.join(n for _, _, n in legendas)}" if legendas else "")
                   + "...")
         saida = pasta / f"{base}.mp4"
-        juntar(video, saida, audio_pt, volume_original, srt)
-        copias = copiar_para(destino, [saida, srt] if srt else [saida])
+        juntar(video, saida, audio_pt, volume_original, legendas)
+        copias = copiar_para(destino, [saida] + [l[0] for l in legendas])
         relogio.fim()
         total = relogio.marcas[-1][1] - relogio.marcas[0][1]
         registrar(f"Pronto em {formato_tempo(total)}! Salvo em: "
@@ -603,7 +668,7 @@ def processar_video(tipo, origem, modo, nome_voz, volume_original, tamanho_model
     finally:
         shutil.rmtree(temp, ignore_errors=True)
 
-    return {"titulo": titulo, "video": saida, "srt": srt, "tempo": total,
+    return {"titulo": titulo, "video": saida, "srt": srt, "srt_en": srt_en, "tempo": total,
             "resumo": resumo_tempos(relogio.marcas, duracao_video)}
 
 
@@ -615,7 +680,7 @@ def resumo_lote(linhas, tempo_total):
             f"**{formato_tempo(tempo_total)}**\n\n" + "\n".join(tabela))
 
 
-def dublar(links, arquivos, modo, nome_voz, tamanho_modelo,
+def dublar(links, arquivos, modo, legenda_en, nome_voz, tamanho_modelo,
            tradutor, pasta_destino, request: gr.Request, progresso=gr.Progress()):
     fila = [("link", l.strip()) for l in (links or "").splitlines() if l.strip()]
     fila += [("arquivo", a) for a in (arquivos or [])]
@@ -661,7 +726,7 @@ def dublar(links, arquivos, modo, nome_voz, tamanho_modelo,
                 registrar(f"===== Vídeo {i + 1} de {len(fila)}: {rotulo} =====")
             try:
                 r = processar_video(tipo, origem, modo, nome_voz, VOLUME_ORIGINAL,
-                                    tamanho_modelo, tradutor, destino,
+                                    tamanho_modelo, tradutor, legenda_en, destino,
                                     Relogio(progresso, tamanho_modelo, etapas, lote), checar)
             except gr.Error as e:
                 erro = e.message
@@ -694,9 +759,11 @@ def dublar(links, arquivos, modo, nome_voz, tamanho_modelo,
     print(resumo.replace("**", ""))
 
     ultimo = prontos[-1]
-    arquivos_gerados = [str(p) for r in prontos for p in (r["video"], r["srt"]) if p]
+    arquivos_gerados = [str(p) for r in prontos
+                        for p in (r["video"], r["srt"], r["srt_en"]) if p]
+    legenda_player = ultimo["srt"] or ultimo["srt_en"]  # o player mostra uma só
     return (gr.Video(str(ultimo["video"]),
-                     subtitles=str(ultimo["srt"]) if ultimo["srt"] else None,
+                     subtitles=str(legenda_player) if legenda_player else None,
                      label=ultimo["titulo"]),
             arquivos_gerados,
             resumo)
@@ -735,6 +802,9 @@ with gr.Blocks(title="Dublador EN para PT") as app:
             arquivo = gr.File(label="Ou envie arquivos de vídeo", file_count="multiple",
                               file_types=["video"], type="filepath")
             modo = gr.Radio(MODOS, value=MODOS[0], label="O que você quer gerar?")
+            legenda_en = gr.Checkbox(
+                label="Incluir também a legenda em inglês",
+                info="Vai como faixa extra no vídeo (escolha no player) e em arquivo .en.srt")
             with gr.Column() as opcoes_voz:
                 voz = gr.Dropdown(list(VOZES), value="Antonio (masculina)", label="Voz")
                 botao_ouvir = gr.Button("🔊 Ouvir a voz", size="sm")
@@ -766,7 +836,7 @@ with gr.Blocks(title="Dublador EN para PT") as app:
                       voz, amostra)
     relogio_log.tick(mostrar_log, None, log_saida, show_progress="hidden")
     botao.click(lambda: gr.Timer(active=True), None, relogio_log).then(
-        dublar, [url, arquivo, modo, voz, modelo, tradutor, pasta_destino],
+        dublar, [url, arquivo, modo, legenda_en, voz, modelo, tradutor, pasta_destino],
         [video_saida, arquivos_saida, tempo_saida],
         show_progress_on=[video_saida]).then(
         fim_do_log, None, [log_saida, relogio_log])
