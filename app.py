@@ -45,6 +45,7 @@ VOZES = {
 }
 
 AMOSTRA = "Olá! Esta é a voz que vai dublar o seu vídeo em português."
+VOLUME_ORIGINAL = 0  # volume do áudio em inglês ao fundo da dublagem (0 = sem áudio original)
 
 MODOS = ["Dublagem e legenda", "Só dublagem", "Só legenda"]
 TRADUTORES = ["No computador (rápido e sem limite)", "Online (Google ou MyMemory)"]
@@ -614,7 +615,7 @@ def resumo_lote(linhas, tempo_total):
             f"**{formato_tempo(tempo_total)}**\n\n" + "\n".join(tabela))
 
 
-def dublar(links, arquivos, modo, nome_voz, volume_original, tamanho_modelo,
+def dublar(links, arquivos, modo, nome_voz, tamanho_modelo,
            tradutor, pasta_destino, request: gr.Request, progresso=gr.Progress()):
     fila = [("link", l.strip()) for l in (links or "").splitlines() if l.strip()]
     fila += [("arquivo", a) for a in (arquivos or [])]
@@ -659,7 +660,7 @@ def dublar(links, arquivos, modo, nome_voz, volume_original, tamanho_modelo,
             if len(fila) > 1:
                 registrar(f"===== Vídeo {i + 1} de {len(fila)}: {rotulo} =====")
             try:
-                r = processar_video(tipo, origem, modo, nome_voz, volume_original,
+                r = processar_video(tipo, origem, modo, nome_voz, VOLUME_ORIGINAL,
                                     tamanho_modelo, tradutor, destino,
                                     Relogio(progresso, tamanho_modelo, etapas, lote), checar)
             except gr.Error as e:
@@ -739,8 +740,6 @@ with gr.Blocks(title="Dublador EN para PT") as app:
                 botao_ouvir = gr.Button("🔊 Ouvir a voz", size="sm")
                 amostra = gr.Audio(label="Amostra da voz", autoplay=True,
                                    interactive=False, visible=False)
-                volume = gr.Slider(0, 0.5, value=0.1, step=0.05,
-                                   label="Volume do áudio original ao fundo")
             modelo = gr.Dropdown(["tiny", "base", "small", "medium"], value="small",
                                  label="Precisão da transcrição (maior = melhor e mais lento)")
             tradutor = gr.Radio(TRADUTORES, value=TRADUTORES[0], label="Tradutor")
@@ -767,7 +766,7 @@ with gr.Blocks(title="Dublador EN para PT") as app:
                       voz, amostra)
     relogio_log.tick(mostrar_log, None, log_saida, show_progress="hidden")
     botao.click(lambda: gr.Timer(active=True), None, relogio_log).then(
-        dublar, [url, arquivo, modo, voz, volume, modelo, tradutor, pasta_destino],
+        dublar, [url, arquivo, modo, voz, modelo, tradutor, pasta_destino],
         [video_saida, arquivos_saida, tempo_saida],
         show_progress_on=[video_saida]).then(
         fim_do_log, None, [log_saida, relogio_log])
