@@ -46,7 +46,7 @@ VOZES = {
 
 AMOSTRA = "Olá! Esta é a voz que vai dublar o seu vídeo em português."
 VOLUME_ORIGINAL = 0  # volume do áudio em inglês ao fundo da dublagem (0 = sem áudio original)
-VELOCIDADE_MAX_FALA = 1.5  # acima disso, o vídeo fica mais lento para a fala caber
+VELOCIDADE_PADRAO = 1.0  # velocidade máxima da fala; acima dela o vídeo fica mais lento
 
 MODOS = ["Dublagem e legenda", "Só dublagem", "Só legenda"]
 TRADUTORES = ["No computador (rápido e sem limite)", "Online (Google ou MyMemory)"]
@@ -155,20 +155,36 @@ def nome_arquivo(texto):
     return " ".join(limpo.split())[:120].strip(" .") or "video"
 
 
-def pasta_padrao():
+def ler_config():
     try:
-        return json.loads(CONFIG.read_text())["pasta_destino"]
-    except (OSError, ValueError, KeyError):
-        videos = Path.home() / "Videos"
-        return str((videos if videos.is_dir() else Path.home()) / "Dublados")
+        return json.loads(CONFIG.read_text())
+    except (OSError, ValueError):
+        return {}
 
 
-def lembrar_pasta(pasta):
+def pasta_padrao():
+    videos = Path.home() / "Videos"
+    padrao = str((videos if videos.is_dir() else Path.home()) / "Dublados")
+    return ler_config().get("pasta_destino", padrao)
+
+
+def velocidade_padrao():
+    return ler_config().get("velocidade", VELOCIDADE_PADRAO)
+
+
+def lembrar(**valores):
     try:
         CONFIG.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG.write_text(json.dumps({"pasta_destino": str(pasta)}))
+        CONFIG.write_text(json.dumps({**ler_config(), **valores}))
     except OSError:
         pass  # só deixa de lembrar; não atrapalha a dublagem
+
+
+def ritmo_voz(velocidade):
+    """Velocidade em que a voz é gerada, no formato do edge-tts (ex.: "-10%").
+    Abaixo de 1,0 a voz já nasce mais lenta; acima, ela nasce normal e pode
+    ser acelerada depois, até a velocidade escolhida."""
+    return f"{round((min(velocidade, 1.0) - 1) * 100):+d}%"
 
 
 def escolher_pasta(atual):
@@ -413,7 +429,7 @@ def _traduzir_local(segmentos, passo, lote=16):
             registrar(f"[{posicao(s['inicio'])}] PT: {s['pt']}")
 
 
-async def _gerar_vozes(segmentos, voz, pasta, passo, tentativas=3):
+async def _gerar_vozes(segmentos, voz, velocidade, pasta, passo, tentativas=3):
     """Gera a fala de cada frase. Uma frase que falhar fica sem voz, sem parar o vídeo."""
     for i, s in enumerate(segmentos):
         passo(i, len(segmentos))
@@ -424,7 +440,8 @@ async def _gerar_vozes(segmentos, voz, pasta, passo, tentativas=3):
         arq = pasta / f"fala_{i:04}.mp3"
         for tentativa in range(1, tentativas + 1):
             try:
-                await edge_tts.Communicate(s["pt"], voz).save(str(arq))
+                await edge_tts.Communicate(s["pt"], voz,
+                                           rate=ritmo_voz(velocidade)).save(str(arq))
                 s["arquivo"] = arq
                 registrar(f"Voz gerada: frase {i + 1} de {len(segmentos)}")
                 break
@@ -446,10 +463,11 @@ def nova_posicao(t, trechos):
     return t + sum((fator - 1) * min(max(t - a, 0), b - a) for a, b, fator in trechos)
 
 
-def montar_audio(segmentos, duracao_total, passo):
-    """Coloca cada fala no seu tempo. Se não couber, acelera a fala até
-    VELOCIDADE_MAX_FALA; se ainda assim não couber, marca o trecho do vídeo para
+def montar_audio(segmentos, duracao_total, passo, velocidade):
+    """Coloca cada fala no seu tempo. Se não couber, acelera a fala sem passar da
+    velocidade escolhida; se ainda assim não couber, marca o trecho do vídeo para
     ficar mais lento. Devolve a trilha e os trechos (início, fim, fator)."""
+    acelera_ate = max(velocidade, 1.0)  # abaixo de 1,0 a voz já foi gerada mais lenta
     clipes, trechos = [], []
     for i, s in enumerate(segmentos):
         passo(i, len(segmentos))
@@ -461,13 +479,15 @@ def montar_audio(segmentos, duracao_total, passo):
         espaco = max(proximo - s["inicio"], 0.05)
         dur = len(clipe) / SR
         if dur > espaco:
-            tempo = min(dur / espaco, VELOCIDADE_MAX_FALA)
-            clipe = carregar_pcm(s["arquivo"], tempo=tempo)
+            tempo = min(dur / espaco, acelera_ate)
+            if tempo > 1.0:
+                clipe = carregar_pcm(s["arquivo"], tempo=tempo)
             fator = (len(clipe) / SR) / espaco
             if fator > 1.01:
                 trechos.append((s["inicio"], s["inicio"] + espaco, fator))
-                registrar(f"[{posicao(s['inicio'])}] Fala acelerada {tempo:.2f}x e "
-                          f"vídeo desacelerado {fator:.2f}x neste trecho")
+                registrar(f"[{posicao(s['inicio'])}] "
+                          + (f"Fala acelerada {tempo:.2f}x e v" if tempo > 1.01 else "V")
+                          + f"ídeo desacelerado {fator:.2f}x neste trecho")
             elif tempo > 1.01:
                 registrar(f"[{posicao(s['inicio'])}] Fala em português mais longa: "
                           f"acelerada {tempo:.2f}x")
@@ -538,13 +558,20 @@ def salvar_srt(segmentos, arquivo, idioma="pt"):
 
 # ---------- função principal ----------
 
-def ouvir_voz(nome_voz):
+def ouvir_voz(nome_voz, velocidade):
+    """Amostra da voz na velocidade máxima escolhida (o mais rápido que ela vai falar)."""
     pasta = PASTA_SAIDA / "amostras"
     pasta.mkdir(exist_ok=True)
-    arq = pasta / f"{VOZES[nome_voz]}.mp3"
-    if not arq.exists():
-        asyncio.run(edge_tts.Communicate(AMOSTRA, VOZES[nome_voz]).save(str(arq)))
-    return str(arq)
+    normal = pasta / f"{VOZES[nome_voz]}_{min(velocidade, 1.0):.2f}x.mp3"
+    if not normal.exists():
+        asyncio.run(edge_tts.Communicate(AMOSTRA, VOZES[nome_voz],
+                                         rate=ritmo_voz(velocidade)).save(str(normal)))
+    if velocidade <= 1.0:
+        return str(normal)
+    acelerada = pasta / f"{VOZES[nome_voz]}_{velocidade:.2f}x.wav"
+    if not acelerada.exists():
+        salvar_wav(acelerada, carregar_pcm(normal, tempo=velocidade))
+    return str(acelerada)
 
 
 def parar(request: gr.Request):
@@ -556,8 +583,8 @@ def mostrar_log(request: gr.Request):
     return "\n".join(_logs.get(request.session_hash, [])[-500:])
 
 
-def processar_video(tipo, origem, modo, nome_voz, volume_original, tamanho_modelo,
-                    tradutor, legenda_en, destino, relogio, checar):
+def processar_video(tipo, origem, modo, nome_voz, velocidade, volume_original,
+                    tamanho_modelo, tradutor, legenda_en, destino, relogio, checar):
     """Dubla e/ou legenda um vídeo (link ou arquivo) e devolve o que foi gerado."""
     dublagem = modo != "Só legenda"
     legenda = modo != "Só dublagem"
@@ -612,10 +639,10 @@ def processar_video(tipo, origem, modo, nome_voz, volume_original, tamanho_model
         audio_pt = None
         if dublagem:
             etapa("Geração da voz", "Gerando a voz em português...")
-            asyncio.run(_gerar_vozes(segmentos, VOZES[nome_voz], temp, passo))
+            asyncio.run(_gerar_vozes(segmentos, VOZES[nome_voz], velocidade, temp, passo))
 
             etapa("Montagem do vídeo", "Montando o vídeo dublado...")
-            trilha, trechos = montar_audio(segmentos, duracao_video, passo)
+            trilha, trechos = montar_audio(segmentos, duracao_video, passo, velocidade)
             audio_pt = temp / "audio_pt.wav"
             salvar_wav(audio_pt, trilha)
             if trechos:
@@ -680,7 +707,7 @@ def resumo_lote(linhas, tempo_total):
             f"**{formato_tempo(tempo_total)}**\n\n" + "\n".join(tabela))
 
 
-def dublar(links, arquivos, modo, legenda_en, nome_voz, tamanho_modelo,
+def dublar(links, arquivos, modo, legenda_en, nome_voz, velocidade, tamanho_modelo,
            tradutor, pasta_destino, request: gr.Request, progresso=gr.Progress()):
     fila = [("link", l.strip()) for l in (links or "").splitlines() if l.strip()]
     fila += [("arquivo", a) for a in (arquivos or [])]
@@ -696,14 +723,14 @@ def dublar(links, arquivos, modo, legenda_en, nome_voz, tamanho_modelo,
         raise gr.Error(f"Não consegui usar a pasta {destino}: {e.strerror}")
     if not os.access(destino, os.W_OK):
         raise gr.Error(f"Sem permissão para salvar na pasta {destino}.")
-    lembrar_pasta(destino)
+    lembrar(pasta_destino=str(destino), velocidade=velocidade)
 
     dublagem = modo != "Só legenda"
     sessao = request.session_hash
     _parar.discard(sessao)
     _logs[sessao] = _local.log = []
     registrar(f"Início: {len(fila)} vídeo(s) | {modo}"
-              + (f" | voz {nome_voz}" if dublagem else "")
+              + (f" | voz {nome_voz}, até {velocidade:.2f}x" if dublagem else "")
               + f" | precisão '{tamanho_modelo}' | tradutor {tradutor}"
               + f" | salvar em {destino}")
 
@@ -725,7 +752,7 @@ def dublar(links, arquivos, modo, legenda_en, nome_voz, tamanho_modelo,
             if len(fila) > 1:
                 registrar(f"===== Vídeo {i + 1} de {len(fila)}: {rotulo} =====")
             try:
-                r = processar_video(tipo, origem, modo, nome_voz, VOLUME_ORIGINAL,
+                r = processar_video(tipo, origem, modo, nome_voz, velocidade, VOLUME_ORIGINAL,
                                     tamanho_modelo, tradutor, legenda_en, destino,
                                     Relogio(progresso, tamanho_modelo, etapas, lote), checar)
             except gr.Error as e:
@@ -807,6 +834,10 @@ with gr.Blocks(title="Dublador EN para PT") as app:
                 info="Vai como faixa extra no vídeo (escolha no player) e em arquivo .en.srt")
             with gr.Column() as opcoes_voz:
                 voz = gr.Dropdown(list(VOZES), value="Antonio (masculina)", label="Voz")
+                velocidade = gr.Slider(
+                    0.7, 1.5, value=velocidade_padrao, step=0.05, label="Velocidade da fala",
+                    info="A voz nunca fala mais rápido que isso. 1,0 = ritmo normal. "
+                         "Quando a fala não cabe na cena, o vídeo fica mais lento.")
                 botao_ouvir = gr.Button("🔊 Ouvir a voz", size="sm")
                 amostra = gr.Audio(label="Amostra da voz", autoplay=True,
                                    interactive=False, visible=False)
@@ -832,11 +863,12 @@ with gr.Blocks(title="Dublador EN para PT") as app:
 
     modo.change(trocar_modo, modo, [opcoes_voz, botao])
     botao_pasta.click(escolher_pasta, pasta_destino, pasta_destino)
-    botao_ouvir.click(lambda nome: gr.Audio(ouvir_voz(nome), visible=True),
-                      voz, amostra)
+    botao_ouvir.click(lambda nome, vel: gr.Audio(ouvir_voz(nome, vel), visible=True),
+                      [voz, velocidade], amostra)
     relogio_log.tick(mostrar_log, None, log_saida, show_progress="hidden")
     botao.click(lambda: gr.Timer(active=True), None, relogio_log).then(
-        dublar, [url, arquivo, modo, legenda_en, voz, modelo, tradutor, pasta_destino],
+        dublar, [url, arquivo, modo, legenda_en, voz, velocidade, modelo, tradutor,
+                 pasta_destino],
         [video_saida, arquivos_saida, tempo_saida],
         show_progress_on=[video_saida]).then(
         fim_do_log, None, [log_saida, relogio_log])
